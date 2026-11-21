@@ -3,10 +3,12 @@ import sqlite3
 from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
+import requests
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 SPORT = os.getenv("SPORT", "NBA").upper()
 SEASON = os.getenv("NBA_SEASON", "2026-27")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
 DB_FILE = os.getenv("DB_FILE", f"{SPORT.lower()}_picks.sqlite")
 CSV_FILE = os.getenv("CSV_FILE", f"{SPORT.lower()}_picks_log.csv")
 
@@ -15,7 +17,7 @@ BANKROLL_START = 1000.0
 MIN_EDGE = 0.03          # Require at least 3.0% edge over no-vig market probability
 KELLY_FRACTION = 0.25    # Quarter Kelly for lower volatility
 MAX_BET_PCT = 0.03       # Never wager more than 3% of bankroll on one pick
-MAX_STALENESS_MIN = 120  # Reject feeds older than 2 hours
+MAX_STALENESS_MIN = 180  # Reject feeds older than 3 hours
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -54,7 +56,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 def sample_historical_games() -> pd.DataFrame:
-    """Fallback sample history so the script still runs if nba_api times out."""
+    """Fallback history so the script still runs if nba_api times out."""
     rows = [
         ("G1", "2026-10-22", "Boston Celtics", "New York Knicks", 132, 109, "final", 1),
         ("G2", "2026-10-23", "Denver Nuggets", "Oklahoma City Thunder", 87, 102, "final", 1),
@@ -79,7 +81,7 @@ def load_nba_games(season: str = SEASON) -> pd.DataFrame:
             season_nullable=season,
             season_type_nullable="Regular Season",
             league_id_nullable="00",
-            timeout=20,
+            timeout=30,
         ).get_data_frames()[0]
 
         if raw_df.empty or "WL" not in raw_df.columns:
@@ -117,6 +119,80 @@ def load_nba_games(season: str = SEASON) -> pd.DataFrame:
         print(f"nba_api fallback triggered ({exc}); using sample games.")
         return sample_historical_games()
 
+def fetch_upcoming_nba_odds() -> list[dict]:
+    """Fetches upcoming NBA h2h decimal odds if ODDS_API_KEY is set, else returns a sample game."""
+    if not ODDS_API_KEY:
+        print("No ODDS_API_KEY set; using sample upcoming game.")
+        return [
+            {
+                "game_id": "G_UPCOMING_1",
+                "game_date": utc_now().strftime("%Y-%m-%d"),
+                "home_team": "New York Knicks",
+                "away_team": "Boston Celtics",
+                "lineup_confirmed": 1,
+                "updated_at": utc_now().isoformat(),
+                "home_odds": 2.25,
+                "away_odds": 1.72,
+            }
+        ]
+
+    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
+    resp = requests.get(
+        url,
+        params={
+            "apiKey": ODDS_API_KEY,
+            "regions": "us",
+            "markets": "h2h",
+            "oddsFormat": "decimal",
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    events = resp.json()
+    parsed = []
+    now_iso = utc_now().isoformat()
+
+    for ev in events:
+        home_team = ev.get("home_team")
+        away_team = ev.get("away_team")
+        bookmakers = ev.get("bookmakers") or []
+        if not home_team or not away_team or not bookmakers:
+            continue
+
+        h2h_outcomes = None
+        for bm in bookmakers:
+            for mkt in bm.get("markets") or []:
+                if mkt.get("key") == "h2h" and len(mkt.get("outcomes") or []) >= 2:
+                    h2h_outcomes = mkt["outcomes"]
+                    break
+            if h2h_outcomes:
+                break
+
+        if not h2h_outcomes:
+            continue
+
+        price_map = {o.get("name"): o.get("price") for o in h2h_outcomes}
+        h_odds = price_map.get(home_team)
+        a_odds = price_map.get(away_team)
+        if not h_odds or not a_odds:
+            continue
+
+        parsed.append(
+            {
+                "game_id": str(ev.get("id")),
+                "game_date": str(ev.get("commence_time", now_iso))[:10],
+                "home_team": str(home_team),
+                "away_team": str(away_team),
+                "lineup_confirmed": 1,
+                "updated_at": now_iso,
+                "home_odds": float(h_odds),
+                "away_odds": float(a_odds),
+            }
+        )
+
+    print(f"Fetched {len(parsed)} live NBA matchups with odds.")
+    return parsed
+
 def build_rolling_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     df = df.sort_values("game_date").reset_index(drop=True).copy()
     elo: dict[str, float] = {}
@@ -137,7 +213,7 @@ def build_rolling_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
 
         if r.status == "final" and r.home_score is not None and r.away_score is not None:
             actual = 1.0 if r.home_score > r.away_score else (0.5 if r.home_score == r.away_score else 0.0)
-            exp_home = 1.0 / (1.0 + 10.0 ** ((a_elo - (h_elo + 45.0)) / 400.0))
+            exp_home = 1.0 / (1.0 + 10.0 ** (((a_elo) - (h_elo + 45.0)) / 400.0))
             delta = 20.0 * (actual - exp_home)
             elo[r.home_team] = h_elo + delta
             elo[r.away_team] = a_elo - delta
@@ -186,62 +262,52 @@ def main() -> None:
         clf = HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, max_iter=80, random_state=42)
         clf.fit(feat[["elo_gap", "margin_gap"]], feat["home_win"])
 
-    # Example upcoming game (replace with live feed/API output)
-    upcoming = {
-        "game_id": "G_UPCOMING_1",
-        "game_date": utc_now().strftime("%Y-%m-%d"),
-        "home_team": "New York Knicks",
-        "away_team": "Boston Celtics",
-        "lineup_confirmed": 1,
-        "updated_at": utc_now().isoformat(),
-        "home_odds": 2.25,
-        "away_odds": 1.72,
-    }
-
-    age_min = (utc_now() - datetime.fromisoformat(upcoming["updated_at"])).total_seconds() / 60.0
-    if not upcoming["lineup_confirmed"] or age_min > MAX_STALENESS_MIN:
-        print("Skipped game: unconfirmed lineup or stale data.")
-        conn.close()
-        return
-
-    h_elo = float(feat.loc[feat["home_team"] == upcoming["home_team"], "home_elo"].tail(1).squeeze()) if upcoming["home_team"] in set(feat["home_team"]) else 1500.0
-    a_elo = float(feat.loc[feat["away_team"] == upcoming["away_team"], "away_elo"].tail(1).squeeze()) if upcoming["away_team"] in set(feat["away_team"]) else 1500.0
-    elo_prob = 1.0 / (1.0 + 10.0 ** ((a_elo - (h_elo + 45.0)) / 400.0))
-
-    if clf is not None:
-        x_next = pd.DataFrame([{"elo_gap": (h_elo + 45.0) - a_elo, "margin_gap": 0.0}])
-        model_home_prob = 0.5 * elo_prob + 0.5 * float(clf.predict_proba(x_next)[0, 1])
-    else:
-        model_home_prob = elo_prob
-
-    nv_home, nv_away = no_vig_probs(upcoming["home_odds"], upcoming["away_odds"])
-    model_away_prob = 1.0 - model_home_prob
-
+    upcoming_games = fetch_upcoming_nba_odds()
     pnl_row = conn.execute("SELECT COALESCE(SUM(pnl), 0.0) FROM picks WHERE pnl IS NOT NULL").fetchone()
     bankroll = BANKROLL_START + float(pnl_row[0])
 
-    candidates = [
-        ("HOME", upcoming["home_team"], upcoming["home_odds"], model_home_prob, nv_home),
-        ("AWAY", upcoming["away_team"], upcoming["away_odds"], model_away_prob, nv_away),
-    ]
+    for upcoming in upcoming_games:
+        age_min = (utc_now() - datetime.fromisoformat(upcoming["updated_at"])).total_seconds() / 60.0
+        if not upcoming["lineup_confirmed"] or age_min > MAX_STALENESS_MIN:
+            print(f"Skipped {upcoming['game_id']}: unconfirmed lineup or stale data.")
+            continue
 
-    for side, team, odds, m_prob, nv_prob in candidates:
-        edge = m_prob - nv_prob
-        stake = kelly_stake(bankroll, m_prob, odds, edge)
-        if stake > 0:
-            exists = conn.execute(
-                "SELECT 1 FROM picks WHERE game_id = ? AND pick_side = ?",
-                (upcoming["game_id"], side),
-            ).fetchone()
-            if not exists:
-                conn.execute(
-                    """
-                    INSERT INTO picks (game_id, pick_side, team, odds_decimal, model_prob, no_vig_prob, edge, stake, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (upcoming["game_id"], side, team, odds, round(m_prob, 4), round(nv_prob, 4), round(edge, 4), stake, utc_now().isoformat()),
-                )
-                print(f"Logged +EV pick: {team} ({side}) @ {odds} | Edge: {edge:.2%} | Stake: ${stake:.2f}")
+        h_elo = float(feat.loc[feat["home_team"] == upcoming["home_team"], "home_elo"].tail(1).squeeze()) if upcoming["home_team"] in set(feat["home_team"]) else 1500.0
+        a_elo = float(feat.loc[feat["away_team"] == upcoming["away_team"], "away_elo"].tail(1).squeeze()) if upcoming["away_team"] in set(feat["away_team"]) else 1500.0
+        elo_prob = 1.0 / (1.0 + 10.0 ** ((a_elo - (h_elo + 45.0)) / 400.0))
+
+        if clf is not None:
+            x_next = pd.DataFrame([{"elo_gap": (h_elo + 45.0) - a_elo, "margin_gap": 0.0}])
+            model_home_prob = 0.5 * elo_prob + 0.5 * float(clf.predict_proba(x_next)[0, 1])
+        else:
+            model_home_prob = elo_prob
+
+        nv_home, nv_away = no_vig_probs(upcoming["home_odds"], upcoming["away_odds"])
+        model_away_prob = 1.0 - model_home_prob
+
+        candidates = [
+            ("HOME", upcoming["home_team"], upcoming["home_odds"], model_home_prob, nv_home),
+            ("AWAY", upcoming["away_team"], upcoming["away_odds"], model_away_prob, nv_away),
+        ]
+
+        for side, team, odds, m_prob, nv_prob in candidates:
+            edge = m_prob - nv_prob
+            stake = kelly_stake(bankroll, m_prob, odds, edge)
+            if stake > 0:
+                exists = conn.execute(
+                    "SELECT 1 FROM picks WHERE game_id = ? AND pick_side = ?",
+                    (upcoming["game_id"], side),
+                ).fetchone()
+                if not exists:
+                    conn.execute(
+                        """
+                        INSERT INTO picks (game_id, pick_side, team, odds_decimal, model_prob, no_vig_prob, edge, stake, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (upcoming["game_id"], side, team, odds, round(m_prob, 4), round(nv_prob, 4), round(edge, 4), stake, utc_now().isoformat()),
+                    )
+                    bankroll = round(bankroll - stake, 2)
+                    print(f"Logged +EV pick: {team} ({side}) @ {odds} | Edge: {edge:.2%} | Stake: ${stake:.2f}")
 
     conn.commit()
     export_csv(conn)
