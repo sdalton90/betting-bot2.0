@@ -10,12 +10,14 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install numpy pandas scikit-learn nba_api
+      - run: pip install numpy pandas scikit-learn nba_api requests
       - run: python betting_bot.py
       - name: Save updated CSV log
         run: |
