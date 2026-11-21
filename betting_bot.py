@@ -1,4 +1,3 @@
-import csv
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -7,6 +6,7 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 SPORT = os.getenv("SPORT", "NBA").upper()
+SEASON = os.getenv("NBA_SEASON", "2026-27")
 DB_FILE = os.getenv("DB_FILE", f"{SPORT.lower()}_picks.sqlite")
 CSV_FILE = os.getenv("CSV_FILE", f"{SPORT.lower()}_picks_log.csv")
 
@@ -54,21 +54,68 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 def sample_historical_games() -> pd.DataFrame:
-    """Starter sample history so the script runs immediately on day 1."""
+    """Fallback sample history so the script still runs if nba_api times out."""
     rows = [
-        ("G1", "2026-10-22", "Celtics", "Knicks", 132, 109, "final", 1),
-        ("G2", "2026-10-23", "Nuggets", "Thunder", 87, 102, "final", 1),
-        ("G3", "2026-10-25", "Knicks", "Pacers", 123, 98, "final", 1),
-        ("G4", "2026-10-26", "Celtics", "Wizards", 122, 102, "final", 1),
-        ("G5", "2026-10-28", "Thunder", "Hawks", 128, 104, "final", 1),
-        ("G6", "2026-10-29", "Nuggets", "Nets", 144, 139, "final", 1),
-        ("G7", "2026-10-30", "Knicks", "Heat", 116, 107, "final", 1),
-        ("G8", "2026-11-01", "Celtics", "Hornets", 124, 109, "final", 1),
+        ("G1", "2026-10-22", "Boston Celtics", "New York Knicks", 132, 109, "final", 1),
+        ("G2", "2026-10-23", "Denver Nuggets", "Oklahoma City Thunder", 87, 102, "final", 1),
+        ("G3", "2026-10-25", "New York Knicks", "Indiana Pacers", 123, 98, "final", 1),
+        ("G4", "2026-10-26", "Boston Celtics", "Washington Wizards", 122, 102, "final", 1),
+        ("G5", "2026-10-28", "Oklahoma City Thunder", "Atlanta Hawks", 128, 104, "final", 1),
+        ("G6", "2026-10-29", "Denver Nuggets", "Brooklyn Nets", 144, 139, "final", 1),
+        ("G7", "2026-10-30", "New York Knicks", "Miami Heat", 116, 107, "final", 1),
+        ("G8", "2026-11-01", "Boston Celtics", "Charlotte Hornets", 124, 109, "final", 1),
     ]
     return pd.DataFrame(
         rows,
         columns=["game_id", "game_date", "home_team", "away_team", "home_score", "away_score", "status", "lineup_confirmed"],
     )
+
+def load_nba_games(season: str = SEASON) -> pd.DataFrame:
+    """Fetches finished NBA games via nba_api, falling back to sample data on timeout/error."""
+    try:
+        from nba_api.stats.endpoints import leaguegamefinder
+
+        raw_df = leaguegamefinder.LeagueGameFinder(
+            season_nullable=season,
+            season_type_nullable="Regular Season",
+            league_id_nullable="00",
+            timeout=20,
+        ).get_data_frames()[0]
+
+        if raw_df.empty or "WL" not in raw_df.columns:
+            return sample_historical_games()
+
+        finished = raw_df[raw_df["WL"].notna()].copy()
+        home_df = finished[finished["MATCHUP"].str.contains(" vs. ", na=False)].copy()
+        away_df = finished[finished["MATCHUP"].str.contains(" @ ", na=False)].copy()
+
+        merged = pd.merge(
+            home_df[["GAME_ID", "GAME_DATE", "TEAM_NAME", "PTS"]],
+            away_df[["GAME_ID", "TEAM_NAME", "PTS"]],
+            on="GAME_ID",
+            suffixes=("_home", "_away"),
+        )
+        if merged.empty:
+            return sample_historical_games()
+
+        games_df = pd.DataFrame(
+            {
+                "game_id": merged["GAME_ID"].astype(str),
+                "game_date": pd.to_datetime(merged["GAME_DATE"]).dt.strftime("%Y-%m-%d"),
+                "home_team": merged["TEAM_NAME_home"].astype(str),
+                "away_team": merged["TEAM_NAME_away"].astype(str),
+                "home_score": merged["PTS_home"].astype(int),
+                "away_score": merged["PTS_away"].astype(int),
+                "status": "final",
+                "lineup_confirmed": 1,
+            }
+        )
+        games_df = games_df.drop_duplicates(subset=["game_id"]).reset_index(drop=True)
+        print(f"Loaded {len(games_df)} real NBA games from nba_api for {season}.")
+        return games_df
+    except Exception as exc:
+        print(f"nba_api fallback triggered ({exc}); using sample games.")
+        return sample_historical_games()
 
 def build_rolling_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     df = df.sort_values("game_date").reset_index(drop=True).copy()
@@ -90,7 +137,7 @@ def build_rolling_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
 
         if r.status == "final" and r.home_score is not None and r.away_score is not None:
             actual = 1.0 if r.home_score > r.away_score else (0.5 if r.home_score == r.away_score else 0.0)
-            exp_home = 1.0 / (1.0 + 10.0 ** (((a_elo) - (h_elo + 45.0)) / 400.0))
+            exp_home = 1.0 / (1.0 + 10.0 ** ((a_elo - (h_elo + 45.0)) / 400.0))
             delta = 20.0 * (actual - exp_home)
             elo[r.home_team] = h_elo + delta
             elo[r.away_team] = a_elo - delta
@@ -131,7 +178,7 @@ def main() -> None:
     conn = sqlite3.connect(DB_FILE)
     init_db(conn)
 
-    hist = sample_historical_games()
+    hist = load_nba_games(SEASON)
     feat = build_rolling_features(hist)
 
     clf = None
@@ -143,8 +190,8 @@ def main() -> None:
     upcoming = {
         "game_id": "G_UPCOMING_1",
         "game_date": utc_now().strftime("%Y-%m-%d"),
-        "home_team": "Knicks",
-        "away_team": "Celtics",
+        "home_team": "New York Knicks",
+        "away_team": "Boston Celtics",
         "lineup_confirmed": 1,
         "updated_at": utc_now().isoformat(),
         "home_odds": 2.25,
